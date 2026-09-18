@@ -311,27 +311,50 @@ fn uptime() -> u64 {
         .unwrap_or(0.0) as u64
 }
 
-/// The first real address of each family the kernel reports. On a VPS these
-/// are the public ones; behind NAT the v4 is private, which is what the machine
-/// actually holds -- no external service is consulted.
+/// The first public address of each family the kernel reports. A private one --
+/// a docker bridge, a NAT'd v4 -- names a network the machine sits behind rather
+/// than the machine itself, so it is skipped and the hub shows the address the
+/// connection arrived from instead. No external service is consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
-/// machine's address. [`is_stacked`] is not applied here: it answers whether
-/// bytes were already counted lower down, and a bridge holding the host address
-/// is both stacked and this machine.
+/// Filtered by [`SKIP_IFACES`] as well, so a container network cannot pass for
+/// the machine's address even where it holds a public range. [`is_stacked`] is
+/// not applied here: it answers whether bytes were already counted lower down,
+/// and a bridge holding the host address is both stacked and this machine.
 fn addresses() -> (String, String) {
     let (mut v4, mut v6) = (String::new(), String::new());
     for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skip_iface(&iface.name) || iface.is_link_local() || !iface.is_oper_up() {
+        if skip_iface(&iface.name) || !iface.is_oper_up() {
             continue;
         }
-        match iface.ip() {
+        let ip = iface.ip();
+        if !reportable(ip) {
+            continue;
+        }
+        match ip {
             std::net::IpAddr::V4(ip) if v4.is_empty() => v4 = ip.to_string(),
             std::net::IpAddr::V6(ip) if v6.is_empty() => v6 = ip.to_string(),
             _ => {}
         }
     }
     (v4, v6)
+}
+
+/// An address a human could reach this machine at. Private and link-local
+/// addresses name the network the machine sits behind, not the machine itself,
+/// so reporting one would advertise somewhere no one can connect to.
+fn reportable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback() && !v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            !is_unique_local(v6) && !v6.is_loopback() && !v6.is_unicast_link_local()
+        }
+    }
+}
+
+/// Unique-local IPv6 (fc00::/7), the v6 analogue of a private v4. The stable
+/// standard library provides no predicate for it.
+fn is_unique_local(ip: std::net::Ipv6Addr) -> bool {
+    ip.segments()[0] & 0xfe00 == 0xfc00
 }
 
 /// Sums the kernel's lifetime byte counters, one count per byte on the wire.
@@ -740,18 +763,40 @@ mod tests {
         let mut c = Collector::new();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
-        // Whatever this host reports must parse, and a virtual bridge must not
-        // be selected.
+        // Whatever this host reports must parse, and must name an address a
+        // human could reach it at. A host whose interfaces are all private --
+        // docker bridges, a NAT'd v4 -- reports none, and the hub shows the
+        // address the connection arrived from instead.
         assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());
         assert!(f.ipv6.is_empty() || f.ipv6.parse::<std::net::Ipv6Addr>().is_ok());
-        assert!(!f.ipv4.is_empty() || !f.ipv6.is_empty(), "a reachable host has at least one address");
-        // The prefix filter is the only guard keeping a docker bridge out.
-        assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
+        assert!(f.ipv4.parse::<std::net::Ipv4Addr>().map_or(true, |ip| reportable(ip.into())),
+                "not an address this machine is reachable at: {}", f.ipv4);
+        assert!(f.ipv6.parse::<std::net::Ipv6Addr>().map_or(true, |ip| reportable(ip.into())),
+                "not an address this machine is reachable at: {}", f.ipv6);
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
         assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
+    }
+
+    /// A private address is not where a machine is reachable, so it is never
+    /// reported: the panel would then advertise somewhere no one can connect to.
+    /// The hub falls back to the address it observed the agent arrive from,
+    /// which on a NAT'd host is the public one.
+    #[test]
+    fn only_public_addresses_are_reported() {
+        let report = |s: &str| reportable(s.parse().unwrap());
+        assert!(report("1.2.3.4"), "a public v4 is where the machine is reachable");
+        assert!(report("2606:4700::1111"), "a global v6 is where the machine is reachable");
+        for private in
+            ["10.0.0.1", "172.16.5.4", "172.31.255.254", "192.168.1.1", "169.254.1.1", "127.0.0.1"]
+        {
+            assert!(!report(private), "{private} is not where the machine is reachable");
+        }
+        for private in ["fe80::1", "fc00::1", "fd12:3456::1"] {
+            assert!(!report(private), "{private} is not where the machine is reachable");
+        }
     }
 }
 
