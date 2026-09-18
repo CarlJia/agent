@@ -367,8 +367,10 @@ fn transient_v6(text: &str) -> Vec<Ipv6Addr> {
 /// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
 /// loopback, link-local, 0/8, 192.0.0/24 (where 464XLAT places its CLAT),
 /// 198.18/15 (the fake-IP range TUN-mode proxies such as Clash assign to
-/// themselves), multicast and reserved. On the v6 side only 2000::/3 counts,
-/// which leaves out ULA (fc00::/7), link-local and loopback.
+/// themselves), TEST-NET-2 (198.51.100/24), TEST-NET-3 (203.0.113/24),
+/// and 224/4 which catches both multicast (224-239) and reserved (240-255)
+/// ranges. On the v6 side only 2000::/3 counts, which leaves out ULA
+/// (fc00::/7), link-local and loopback.
 ///
 /// Note: `Ipv4Addr::is_private()` only covers RFC 1918 in stable Rust; the
 /// additional ranges above are not in stdlib and must be checked manually
@@ -387,7 +389,9 @@ pub fn is_public(ip: IpAddr) -> bool {
                 || a >= 224
                 || (a == 100 && b & 0xc0 == 64)
                 || (a == 192 && b == 0 && c == 0)
-                || (a == 198 && b & 0xfe == 18))
+                || (a == 198 && b & 0xfe == 18)
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113))
         }
         IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
     }
@@ -828,10 +832,11 @@ mod tests {
             pair("10.10.1.5", "2401:b60:1c::5")
         );
         // A TUN-mode proxy, a CGNAT overlay and the LAN all listed before the
-        // public address.
+        // public address. 203.0.119.5 sits outside TEST-NET-3 (203.0.113/24)
+        // and is therefore publicly routable.
         assert_eq!(
-            picked(&["198.18.0.1", "100.64.0.9", "192.168.1.5", "203.0.113.7"], &[]),
-            pair("203.0.113.7", "")
+            picked(&["198.18.0.1", "100.64.0.9", "192.168.1.5", "203.0.119.5"], &[]),
+            pair("203.0.119.5", "")
         );
         // With nothing public the kernel's order stands.
         assert_eq!(picked(&["192.168.1.5", "172.19.0.1"], &[]), pair("192.168.1.5", ""));
@@ -877,6 +882,11 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::1",
+            // IANA special-purpose ranges the manual checks must exclude.
+            "198.51.100.5",
+            "203.0.113.5",
+            "240.0.0.1",
+            "255.255.255.255",
         ] {
             assert!(!is_public(ip(s)), "{s}");
         }
