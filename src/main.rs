@@ -357,8 +357,14 @@ async fn session(
 /// interface and travels in the hello. Every other host keeps the resolver's
 /// order.
 async fn dial(host: &str, port: u16, prefer_v4: bool) -> Result<TcpStream> {
-    let mut addrs: Vec<std::net::SocketAddr> =
-        tokio::net::lookup_host((host, port)).await.with_context(|| format!("resolve {host}"))?.collect();
+    // DNS is the unnamed stage before the connect fallback: a slow or failing
+    // resolver would otherwise consume the full CONNECT_DEADLINE before any
+    // TCP SYN, bypassing the per-address DIAL_FALLBACK below.
+    let lookup = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host, port)))
+        .await
+        .with_context(|| format!("resolve {host} timed out after 10s"))?
+        .with_context(|| format!("resolve {host}"))?;
+    let mut addrs: Vec<std::net::SocketAddr> = lookup.collect();
     if prefer_v4 {
         addrs.sort_by_key(|a| !a.is_ipv4());
     }
