@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::Instant;
 
 use serde::Serialize;
@@ -93,8 +94,8 @@ pub struct Facts {
     pub swap_total: u64,
     pub disk_total: u64,
     pub agent_version: String,
-    /// The host's own addresses. The hub sees only the family the agent
-    /// connected over, which on a dual-stack host is usually v6.
+    /// The host's own addresses, public ones first; see [`pick`]. The hub sees
+    /// only the family the agent connected over.
     pub ipv4: String,
     pub ipv6: String,
 }
@@ -311,50 +312,81 @@ fn uptime() -> u64 {
         .unwrap_or(0.0) as u64
 }
 
-/// The first public address of each family the kernel reports. A private one --
-/// a docker bridge, a NAT'd v4 -- names a network the machine sits behind rather
-/// than the machine itself, so it is skipped and the hub shows the address the
-/// connection arrived from instead. No external service is consulted.
+/// One address of each family the machine holds. Behind NAT the v4 is private,
+/// which is what the machine actually holds -- no external service is
+/// consulted.
 ///
-/// Filtered by [`SKIP_IFACES`] as well, so a container network cannot pass for
-/// the machine's address even where it holds a public range. [`is_stacked`] is
-/// not applied here: it answers whether bytes were already counted lower down,
-/// and a bridge holding the host address is both stacked and this machine.
+/// Filtered by [`SKIP_IFACES`] alone, so a docker bridge cannot pass for the
+/// machine's address. [`is_stacked`] is not applied here: it answers whether
+/// bytes were already counted lower down, and a bridge holding the host address
+/// is both stacked and this machine.
 fn addresses() -> (String, String) {
-    let (mut v4, mut v6) = (String::new(), String::new());
-    for iface in if_addrs::get_if_addrs().unwrap_or_default() {
-        if skip_iface(&iface.name) || !iface.is_oper_up() {
-            continue;
-        }
-        let ip = iface.ip();
-        if !reportable(ip) {
-            continue;
-        }
-        match ip {
-            std::net::IpAddr::V4(ip) if v4.is_empty() => v4 = ip.to_string(),
-            std::net::IpAddr::V6(ip) if v6.is_empty() => v6 = ip.to_string(),
-            _ => {}
-        }
-    }
-    (v4, v6)
+    let transient = transient_v6(&fs::read_to_string("/proc/net/if_inet6").unwrap_or_default());
+    let held: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !skip_iface(&i.name) && !i.is_link_local() && i.is_oper_up())
+        .map(|i| i.ip())
+        .collect();
+    pick(&held, &transient)
 }
 
-/// An address a human could reach this machine at. Private and link-local
-/// addresses name the network the machine sits behind, not the machine itself,
-/// so reporting one would advertise somewhere no one can connect to.
-fn reportable(ip: std::net::IpAddr) -> bool {
+/// A public address before any other, then a stable v6 before a transient
+/// one; ties keep the kernel's order. Taking the first address instead would
+/// report a ULA or a proxy's TUN address whenever its interface is listed
+/// ahead of the one holding the public address: an LXC guest with a ULA on
+/// eth0 and its public /128 on eth1 would report the ULA.
+fn pick(held: &[IpAddr], transient: &[Ipv6Addr]) -> (String, String) {
+    let best = |v6: bool| {
+        held.iter()
+            .filter(|ip| ip.is_ipv6() == v6)
+            .min_by_key(|ip| (!is_public(**ip), matches!(ip, IpAddr::V6(a) if transient.contains(a))))
+            .map_or_else(String::new, ToString::to_string)
+    };
+    (best(false), best(true))
+}
+
+/// IPv6 addresses held but not worth reporting: temporary (privacy extensions,
+/// replaced daily), deprecated (past their preferred lifetime, as an old
+/// prefix is after a home line redials), tentative, or failed duplicate
+/// detection. Read from /proc/net/if_inet6, whose fields are address, ifindex,
+/// prefix length, scope, flags and name; if_addrs does not expose the flags.
+fn transient_v6(text: &str) -> Vec<Ipv6Addr> {
+    // IFA_F_TEMPORARY | IFA_F_DADFAILED | IFA_F_DEPRECATED | IFA_F_TENTATIVE
+    const TRANSIENT: u8 = 0x01 | 0x08 | 0x20 | 0x40;
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let addr = u128::from_str_radix(f.next()?, 16).ok()?;
+            let flags = u8::from_str_radix(f.nth(3)?, 16).ok()?;
+            (flags & TRANSIENT != 0).then(|| Ipv6Addr::from(addr))
+        })
+        .collect()
+}
+
+/// Globally routable. Excluded on the v4 side: RFC 1918, CGNAT (100.64/10),
+/// loopback, link-local, 0/8, 192.0.0/24 (where 464XLAT places its CLAT),
+/// 198.18/15 (the fake-IP range TUN-mode proxies such as Clash assign to
+/// themselves), multicast and reserved. On the v6 side only 2000::/3 counts,
+/// which leaves out ULA (fc00::/7), link-local and loopback.
+///
+/// The hub and its panel apply the same ranges to the addresses this agent
+/// reports; the three lists are to be changed together.
+pub fn is_public(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback() && !v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            !is_unique_local(v6) && !v6.is_loopback() && !v6.is_unicast_link_local()
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || a == 0
+                || a >= 224
+                || (a == 100 && b & 0xc0 == 64)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 198 && b & 0xfe == 18))
         }
+        IpAddr::V6(v6) => v6.segments()[0] & 0xe000 == 0x2000,
     }
-}
-
-/// Unique-local IPv6 (fc00::/7), the v6 analogue of a private v4. The stable
-/// standard library provides no predicate for it.
-fn is_unique_local(ip: std::net::Ipv6Addr) -> bool {
-    ip.segments()[0] & 0xfe00 == 0xfc00
 }
 
 /// Sums the kernel's lifetime byte counters, one count per byte on the wire.
@@ -763,16 +795,13 @@ mod tests {
         let mut c = Collector::new();
         let f = c.facts();
         assert!(!f.hostname.is_empty() && f.cpu_cores >= 1 && f.mem_total > 0);
-        // Whatever this host reports must parse, and must name an address a
-        // human could reach it at. A host whose interfaces are all private --
-        // docker bridges, a NAT'd v4 -- reports none, and the hub shows the
-        // address the connection arrived from instead.
+        // Whatever this host reports must parse, and a virtual bridge must not
+        // be selected.
         assert!(f.ipv4.is_empty() || f.ipv4.parse::<std::net::Ipv4Addr>().is_ok());
         assert!(f.ipv6.is_empty() || f.ipv6.parse::<std::net::Ipv6Addr>().is_ok());
-        assert!(f.ipv4.parse::<std::net::Ipv4Addr>().map_or(true, |ip| reportable(ip.into())),
-                "not an address this machine is reachable at: {}", f.ipv4);
-        assert!(f.ipv6.parse::<std::net::Ipv6Addr>().map_or(true, |ip| reportable(ip.into())),
-                "not an address this machine is reachable at: {}", f.ipv6);
+        assert!(!f.ipv4.is_empty() || !f.ipv6.is_empty(), "a reachable host has at least one address");
+        // The prefix filter is the only guard keeping a docker bridge out.
+        assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
         assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
@@ -780,22 +809,77 @@ mod tests {
         assert!((0.0..=100.0).contains(&m.cpu));
     }
 
-    /// A private address is not where a machine is reachable, so it is never
-    /// reported: the panel would then advertise somewhere no one can connect to.
-    /// The hub falls back to the address it observed the agent arrive from,
-    /// which on a NAT'd host is the public one.
     #[test]
-    fn only_public_addresses_are_reported() {
-        let report = |s: &str| reportable(s.parse().unwrap());
-        assert!(report("1.2.3.4"), "a public v4 is where the machine is reachable");
-        assert!(report("2606:4700::1111"), "a global v6 is where the machine is reachable");
-        for private in
-            ["10.0.0.1", "172.16.5.4", "172.31.255.254", "192.168.1.1", "169.254.1.1", "127.0.0.1"]
-        {
-            assert!(!report(private), "{private} is not where the machine is reachable");
+    fn the_reported_address_is_the_public_one_whatever_the_kernel_lists_first() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let picked = |held: &[&str], transient: &[Ipv6Addr]| {
+            let held: Vec<IpAddr> = held.iter().map(|s| ip(s)).collect();
+            pick(&held, transient)
+        };
+        let pair = |v4: &str, v6: &str| (v4.to_owned(), v6.to_owned());
+
+        // An LXC NAT guest: private v4 and a ULA on eth0, its public /128 on eth1.
+        assert_eq!(
+            picked(&["10.10.1.5", "fd42:43af:6613:5936::1", "2401:b60:1c::5"], &[]),
+            pair("10.10.1.5", "2401:b60:1c::5")
+        );
+        // A TUN-mode proxy, a CGNAT overlay and the LAN all listed before the
+        // public address.
+        assert_eq!(
+            picked(&["198.18.0.1", "100.64.0.9", "192.168.1.5", "203.0.113.7"], &[]),
+            pair("203.0.113.7", "")
+        );
+        // With nothing public the kernel's order stands.
+        assert_eq!(picked(&["192.168.1.5", "172.19.0.1"], &[]), pair("192.168.1.5", ""));
+
+        // SLAAC with privacy extensions lists the temporary address first.
+        let inet6 = "24098a1e3b4179f0a1b2c3d4e5f60718 02 40 00 01     eth0\n\
+                     24098a1e3b4179f00211223344556677 02 40 00 00     eth0\n\
+                     24098a1e3b4100000211223344556677 02 40 00 20     eth0\n\
+                     fe80000000000000021122fffe334455 02 40 20 80     eth0\n";
+        let transient = transient_v6(inet6);
+        let v6 = |s: &str| s.parse::<Ipv6Addr>().unwrap();
+        assert_eq!(
+            transient,
+            [v6("2409:8a1e:3b41:79f0:a1b2:c3d4:e5f6:718"), v6("2409:8a1e:3b41::211:2233:4455:6677")]
+        );
+        let slaac = [
+            "2409:8a1e:3b41:79f0:a1b2:c3d4:e5f6:718",
+            "2409:8a1e:3b41::211:2233:4455:6677",
+            "2409:8a1e:3b41:79f0:211:2233:4455:6677",
+        ];
+        assert_eq!(picked(&slaac, &transient), pair("", "2409:8a1e:3b41:79f0:211:2233:4455:6677"));
+        // A transient address is still better than none.
+        assert_eq!(picked(&slaac[..1], &transient), pair("", slaac[0]));
+    }
+
+    #[test]
+    fn only_globally_routable_addresses_count_as_public() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        for s in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "100.127.255.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.1",
+            "192.0.0.4",
+            "198.18.0.1",
+            "198.19.255.1",
+            "224.0.0.1",
+            "fd42::1",
+            "fc00::1",
+            "fe80::1",
+            "::1",
+        ] {
+            assert!(!is_public(ip(s)), "{s}");
         }
-        for private in ["fe80::1", "fc00::1", "fd12:3456::1"] {
-            assert!(!report(private), "{private} is not where the machine is reachable");
+        for s in
+            ["1.1.1.1", "100.128.0.1", "198.20.0.1", "192.0.1.1", "223.5.5.5", "2401:b60:1c::5", "3fff::1"]
+        {
+            assert!(is_public(ip(s)), "{s}");
         }
     }
 }
