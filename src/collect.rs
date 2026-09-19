@@ -131,6 +131,17 @@ pub struct Collector {
     prev_net: Option<(Instant, u64, u64)>,
 }
 
+/// The version this binary tells the hub it runs. CI stamps the release tag
+/// into `AGENT_VERSION`; a local build falls back to the crate version, which
+/// does not move with the tags -- before this existed every release claimed
+/// "1.0.0", and the panel could not tell a stale agent from a fresh one.
+pub fn build_version() -> &'static str {
+    match option_env!("AGENT_VERSION") {
+        Some(tag) => tag,
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
+
 impl Collector {
     pub fn new() -> Self {
         Self::default()
@@ -152,7 +163,7 @@ impl Collector {
             mem_total: mem.get("MemTotal").copied().unwrap_or(0),
             swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
             disk_total,
-            agent_version: env!("CARGO_PKG_VERSION").into(),
+            agent_version: build_version().into(),
             ipv4: v4,
             ipv6: v6,
         }
@@ -895,6 +906,13 @@ mod tests {
         {
             assert!(is_public(ip(s)), "{s}");
         }
+    }
+
+    #[test]
+    fn the_reported_version_is_never_empty() {
+        // option_env! is fixed at compile time, so what this guards is the
+        // fallback chain itself; the tag CI stamps in has no seam here.
+        assert!(!build_version().is_empty());
     }
 }
 
