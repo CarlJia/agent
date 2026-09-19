@@ -1,0 +1,5 @@
+# cross keeps the host environment out of the build container, so anything the
+# build needs inside has to be named here. AGENT_VERSION carries the release
+# tag CI stamps in; src/collect.rs reads it through option_env!.
+[build.env]
+passthrough = ["AGENT_VERSION"]

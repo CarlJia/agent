@@ -22,13 +22,15 @@ jobs:
       - run: cargo install --locked cross
       # The agent reports this version to the hub, whose panel shows it per
       # node: stamped with the release tag, a stale agent is visible at a
-      # glance, where the never-bumped crate version was not. The flag rides
-      # after the subcommand on purpose: cross's own parser takes the first
-      # non-flag argument as the subcommand, so a leading --config made its
-      # value the "subcommand", skipped the container and fell back to the
-      # host, where no musl cross-cc exists. After `build` the argument is
-      # forwarded verbatim to cargo inside the container.
-      - run: cross build --config "env.AGENT_VERSION=\"${GITHUB_REF_NAME#v}\"" --release --locked --target ${{ matrix.target }}
+      # glance, where the never-bumped crate version was not. cross keeps the
+      # host environment out of the build container, so the variable is named
+      # in Cross.toml's passthrough list and this step only has to export it.
+      # Do not stamp it through cargo's --config instead: that word lands
+      # ahead of the subcommand, cross's own parser claims it as the
+      # subcommand, and cross answers by silently building on the host, where
+      # no musl cross-cc exists.
+      - run: echo "AGENT_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - run: cross build --release --locked --target ${{ matrix.target }}
       # install.sh downloads exactly this name; changing it breaks every
       # install command the hub issues.
       - run: cp "target/${{ matrix.target }}/release/monitor-agent" "monitor-agent-${{ matrix.target }}"
