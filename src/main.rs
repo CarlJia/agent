@@ -40,7 +40,7 @@ fn usage() -> ! {
            --insecure           Allow plain ws:// to a remote hub; the token\n  \
                                 travels in the clear. Only for a hub reached\n  \
                                 at ip:port with no TLS in front.\n",
-        env!("CARGO_PKG_VERSION")
+        collect::build_version()
     );
     std::process::exit(2)
 }
@@ -385,7 +385,14 @@ async fn connect_first(addrs: &[std::net::SocketAddr]) -> Result<TcpStream> {
             attempt.await
         };
         match result {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                // Dropped here, these would hide why a NAT'd agent ended up on
+                // IPv6: the hub then never sees the public v4 worth showing.
+                if !failures.is_empty() {
+                    eprintln!("unreachable: {}", failures.join("; "));
+                }
+                return Ok(stream);
+            }
             Err(e) => failures.push(format!("{addr}: {e}")),
         }
     }
