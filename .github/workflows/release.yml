@@ -25,10 +25,11 @@ jobs:
       # glance, where the never-bumped crate version was not. cross keeps the
       # host environment out of the build container, so the variable is named
       # in Cross.toml's passthrough list and this step only has to export it.
-      # Do not stamp it through cargo's --config instead: that word lands
-      # ahead of the subcommand, cross's own parser claims it as the
-      # subcommand, and cross answers by silently building on the host, where
-      # no musl cross-cc exists.
+      # Do not stamp it through cargo's --config instead: cross's own parser
+      # drops every leading flag and takes the first non-flag word as the
+      # subcommand, so the flag's *value* would be read as the subcommand, the
+      # real `build` ignored, and cross answers by silently building on the
+      # host, where no musl cross-cc exists.
       - run: echo "AGENT_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
       - run: cross build --release --locked --target ${{ matrix.target }}
       # install.sh downloads exactly this name; changing it breaks every
