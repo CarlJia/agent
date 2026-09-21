@@ -137,12 +137,11 @@ struct PingTask {
     interval: u64,
 }
 
-/// Outbound envelope. Serialised as a msgpack array: the field names are
-/// fixed in the schema and the hub decodes by struct position, so we save
-/// the per-key overhead a map would spend on every frame.
-///
-/// `version` rides first so the hub can fail closed on a protocol mismatch
-/// before inspecting method or params.
+/// Outbound envelope. Serialised as a msgpack map (see `notify`): the hub
+/// decodes `params` into an untyped value and reads its fields by name, so a
+/// positional-array encoding would be rejected. `version` rides first so the
+/// hub can fail closed on a protocol mismatch before inspecting method or
+/// params.
 #[derive(Serialize)]
 struct RpcEnvelope<'a, P: Serialize> {
     version: u8,
@@ -151,9 +150,8 @@ struct RpcEnvelope<'a, P: Serialize> {
     params: &'a P,
 }
 
-/// The shape the hub expects for a probe reading. Two integer fields,
-/// msgpack array layout -- the same payload shape the JSON form had before,
-/// just without the quotes and commas.
+/// The shape the hub expects for a probe reading: two named integer fields,
+/// msgpack map layout (`task_id`, `latency_ms`), which the hub reads by name.
 #[derive(Serialize)]
 struct PingResult {
     task_id: i64,
@@ -181,7 +179,14 @@ const PROTOCOL_VERSION: u8 = 1;
 /// here propagates as a session-ending failure rather than a panic.
 fn notify<P: Serialize>(method: &'static str, params: &P) -> Result<Message> {
     let mut buf = Vec::with_capacity(128);
-    let mut ser = rmp_serde::Serializer::new(&mut buf);
+    // `with_struct_map` encodes structs as msgpack maps (field name -> value)
+    // rather than the default positional array. The hub decodes `params` into
+    // an untyped `serde_json::Value` and reads fields by name -- `report()`
+    // opens with `ensure!(metrics.is_object())` -- so an array-encoded struct
+    // would be rejected wholesale. The map still drops JSON's quotes, colons,
+    // braces and commas; it keeps the field names, which is the cost of the
+    // hub reading by name rather than by position.
+    let mut ser = rmp_serde::Serializer::new(&mut buf).with_struct_map();
     RpcEnvelope { version: PROTOCOL_VERSION, jsonrpc: "2.0", method, params }
         .serialize(&mut ser)
         .context("pack envelope")?;
@@ -891,5 +896,85 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+
+    /// The wire contract the hub and agent share, exercised end to end on the
+    /// bytes rather than on a hand-built object. `notify` is what the agent
+    /// actually puts on the socket, and this test decodes its output exactly
+    /// as the hub's `dispatch` does -- so a divergence in field order, map vs
+    /// array encoding, or the version envelope fails here rather than silently
+    /// in production, where the hub would drop every report from a real agent.
+    #[test]
+    fn a_report_frame_survives_the_wire_as_the_hub_decodes_it() {
+        // A minimal hub-side envelope: the same four-field shape the hub's
+        // `Rpc` carries. Kept local so the test needs no dependency on the hub
+        // crate, but structurally identical -- if the shapes drift, the field
+        // names below stop matching and the decode fails.
+        #[derive(Deserialize)]
+        struct HubRpc {
+            version: u8,
+            #[allow(dead_code)]
+            jsonrpc: String,
+            method: String,
+            #[serde(default)]
+            params: serde_json::Value,
+        }
+
+        let metrics = collect::Collector::new().collect();
+        let Ok(Message::Binary(bytes)) = notify("report", &metrics) else {
+            panic!("notify must produce a Binary frame");
+        };
+
+        let rpc: HubRpc = from_slice(&bytes).expect("the hub must be able to decode the agent's frame");
+        assert_eq!(rpc.version, PROTOCOL_VERSION, "the frame carries the protocol version first");
+        assert_eq!(rpc.method, "report");
+        // The hub's `report()` opens with `ensure!(metrics.is_object())` and
+        // then reads fields by name. An array-encoded struct would pass none of
+        // that, so this is the exact guard that a positional encoding would
+        // trip. `mem_used` is one of the fields the live view reads.
+        assert!(rpc.params.is_object(), "the hub reads report fields by name, so params must be a map");
+        assert!(rpc.params.get("mem_used").is_some(), "the report must carry mem_used the hub books");
+        // The invariants moved to hello: a report must not carry them, or the
+        // hub's spread would overwrite the hello-folded totals with a stale copy.
+        assert!(rpc.params.get("mem_total").is_none(), "totals live in hello, not in every report");
+    }
+
+    /// The reverse direction: a `ping.tasks` frame shaped exactly as the hub
+    /// sends it must decode into the agent's `PingTask`. The hub builds
+    /// `params` from `Vec<serde_json::Value>` (each a JSON object), which
+    /// msgpack encodes as a map; if it ever switched to a bare `PingTask`
+    /// struct, rmp would encode a positional array and this decode would fail,
+    /// silently dropping every probe. This pins that contract.
+    #[test]
+    fn a_ping_tasks_frame_from_the_hub_decodes_into_probes() {
+        // Exactly the hub's `Outbound { version, jsonrpc, method, params }`
+        // with `params` a Vec of JSON objects, as `ping_tasks_for` returns.
+        #[derive(Serialize)]
+        struct HubOutbound<'a> {
+            version: u8,
+            jsonrpc: &'a str,
+            method: &'a str,
+            params: Vec<serde_json::Value>,
+        }
+        let out = HubOutbound {
+            version: PROTOCOL_VERSION,
+            jsonrpc: "2.0",
+            method: "ping.tasks",
+            params: vec![
+                serde_json::json!({"id": 1, "target": "1.1.1.1:443", "interval": 60}),
+                serde_json::json!({"id": 2, "target": "8.8.8.8:53", "interval": 30}),
+            ],
+        };
+        let bytes = rmp_serde::to_vec(&out).expect("hub packs its outbound");
+
+        let rpc: Rpc = from_slice(&bytes).expect("agent decodes the hub frame");
+        assert_eq!(rpc.version, PROTOCOL_VERSION);
+        assert_eq!(rpc.method, "ping.tasks");
+        let tasks: Vec<PingTask> =
+            serde_json::from_value(rpc.params).expect("params decode into probes, not silently drop");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, 1);
+        assert_eq!(tasks[0].target, "1.1.1.1:443");
+        assert_eq!(tasks[1].interval, 30);
     }
 }
