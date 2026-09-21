@@ -2,7 +2,7 @@
 
 历史 tag 与 commit 内版本号的对照放在文末「历史发布 Tag / 版本错位」一节。版本发布明细以 [GitHub Releases](https://github.com/CarlJia/agent/releases) 为准。
 
-## 未发布
+## v1.1.0 - 2026-09-21
 
 ### 破坏性变更
 
