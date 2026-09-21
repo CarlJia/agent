@@ -11,7 +11,8 @@ use tokio::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
-use serde::Deserialize;
+use rmp_serde::from_slice;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -114,13 +115,21 @@ fn is_loopback(url: &str) -> bool {
     host.parse::<std::net::IpAddr>().map_or(host == "localhost", |ip| ip.is_loopback())
 }
 
+/// Inbound RPC envelope. `params` is left as a JSON-shaped value because
+/// `rmp-serde` decodes msgpack maps into `serde_json::Value` for free, and
+/// the only frame the hub pushes today is `ping.tasks` decoded below.
+///
+/// `version` is the first field so a future protocol bump can fail closed
+/// before any decoding work happens. Currently pinned to [`PROTOCOL_VERSION`].
 #[derive(Deserialize)]
 struct Rpc {
+    version: u8,
+    #[allow(dead_code)]
+    jsonrpc: String,
     method: String,
     #[serde(default)]
     params: serde_json::Value,
 }
-
 #[derive(Deserialize, Clone, Debug)]
 struct PingTask {
     id: i64,
@@ -128,10 +137,55 @@ struct PingTask {
     interval: u64,
 }
 
-fn notify(method: &str, params: serde_json::Value) -> Message {
-    Message::Text(
-        serde_json::json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string().into(),
-    )
+/// Outbound envelope. Serialised as a msgpack array: the field names are
+/// fixed in the schema and the hub decodes by struct position, so we save
+/// the per-key overhead a map would spend on every frame.
+///
+/// `version` rides first so the hub can fail closed on a protocol mismatch
+/// before inspecting method or params.
+#[derive(Serialize)]
+struct RpcEnvelope<'a, P: Serialize> {
+    version: u8,
+    jsonrpc: &'a str,
+    method: &'a str,
+    params: &'a P,
+}
+
+/// The shape the hub expects for a probe reading. Two integer fields,
+/// msgpack array layout -- the same payload shape the JSON form had before,
+/// just without the quotes and commas.
+#[derive(Serialize)]
+struct PingResult {
+    task_id: i64,
+    latency_ms: i32,
+}
+
+/// Wire-protocol version. Bumped on any breaking change to the envelope
+/// shape -- adding or reordering fields, or changing the value layout of an
+/// existing field. The hub reads this on every inbound frame and rejects
+/// anything that does not match, which keeps an old hub and a new agent
+/// (or vice versa) from negotiating a session that the next packet will
+/// then corrupt.
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Packs an outbound frame as msgpack and wraps it in a WebSocket Binary
+/// message. JSON's quoted strings and per-field names make up most of the
+/// per-frame budget at the agent's ~400-byte report size; msgpack keeps the
+/// field names and drops the quotes, the commas, the brackets and the
+/// `"jsonrpc":"2.0"` literal repeated on every frame.
+///
+/// `Result` rather than `.expect`: msgpack writes one byte at a time into
+/// the buffer and `Serialize::serialize` returns no error for the types the
+/// agent actually sends, but a future struct addition (HashMap<u128,_>,
+/// char, etc.) would. The caller already returns `Result`, so an error
+/// here propagates as a session-ending failure rather than a panic.
+fn notify<P: Serialize>(method: &'static str, params: &P) -> Result<Message> {
+    let mut buf = Vec::with_capacity(128);
+    let mut ser = rmp_serde::Serializer::new(&mut buf);
+    RpcEnvelope { version: PROTOCOL_VERSION, jsonrpc: "2.0", method, params }
+        .serialize(&mut ser)
+        .context("pack envelope")?;
+    Ok(Message::Binary(buf.into()))
 }
 
 /// Writes under a deadline drawn from the remaining silence budget.
@@ -296,7 +350,7 @@ async fn session(
     // every other write, so no two writes can each claim a full HUB_SILENCE.
     let mut last_frame = Instant::now();
 
-    send(&mut ws, notify("hello", serde_json::to_value(facts)?), remaining(last_frame)).await?;
+    send(&mut ws, notify("hello", &facts)?, remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -306,8 +360,27 @@ async fn session(
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                let m = serde_json::to_value(collector.collect())?;
-                if let Err(e) = send(&mut ws, notify("report", m), remaining(last_frame)).await { break Err(e); }
+                // Collect first, so a drift this sample detects (a disk
+                // hot-plug, a memory resize) is queued before the report goes
+                // out. Then, if the invariants moved, send a fresh hello ahead
+                // of the report: the hub folds the new totals into the live
+                // view in the very tick the matching new `used` values arrive,
+                // never pairing a new `disk_used` with a stale `disk_total`.
+                // On a stable host `take_pending_facts` is always None and the
+                // wire cost is zero.
+                let metrics = collector.collect();
+                if let Some(facts) = collector.take_pending_facts() {
+                    let msg = match notify("hello", &facts) {
+                        Ok(m) => m,
+                        Err(e) => break Err(e.context("pack re-hello")),
+                    };
+                    if let Err(e) = send(&mut ws, msg, remaining(last_frame)).await { break Err(e); }
+                }
+                let msg = match notify("report", &metrics) {
+                    Ok(m) => m,
+                    Err(e) => break Err(e.context("pack report")),
+                };
+                if let Err(e) = send(&mut ws, msg, remaining(last_frame)).await { break Err(e); }
             }
             // Rebuilt each pass from the last frame, so silence costs exactly
             // HUB_SILENCE rather than a polling interval more. Kept separate
@@ -323,8 +396,19 @@ async fn session(
                 // heartbeat ping -- the only one on an otherwise idle link.
                 last_frame = Instant::now();
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if let Ok(rpc) = serde_json::from_str::<Rpc>(&text) {
+                    Some(Ok(Message::Binary(buf))) => {
+                        if let Ok(rpc) = from_slice::<Rpc>(&buf) {
+                            // A version mismatch fails closed here rather than
+                            // after the agent has spent minutes sending
+                            // reports the hub silently drops: the cost of
+                            // rolling back to a clean handshake is much lower
+                            // than the cost of a corrupt dashboard.
+                            if rpc.version != PROTOCOL_VERSION {
+                                break Err(anyhow!(
+                                    "hub speaks protocol version {}, this build only understands {}",
+                                    rpc.version, PROTOCOL_VERSION
+                                ));
+                            }
                             if rpc.method == "ping.tasks" {
                                 if let Ok(tasks) = serde_json::from_value::<Vec<PingTask>>(rpc.params) {
                                     respawn_ping_tasks(&mut ping_tasks, tasks, &result_tx);
@@ -461,7 +545,10 @@ fn respawn_ping_tasks(
                     continue;
                 };
                 let msg =
-                    notify("ping.result", serde_json::json!({"task_id": spawned.id, "latency_ms": latency}));
+                    match notify("ping.result", &PingResult { task_id: spawned.id, latency_ms: latency }) {
+                        Ok(m) => m,
+                        Err(_) => return, // pack failure already logged via .context; nothing for the hub to learn
+                    };
                 if tx.send(msg).await.is_err() {
                     return;
                 }
@@ -544,6 +631,7 @@ async fn handshake(addresses: impl Iterator<Item = std::net::SocketAddr>) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::Facts;
 
     #[test]
     fn a_hub_restart_costs_a_second_while_an_unreachable_one_still_backs_off() {
@@ -749,7 +837,7 @@ mod tests {
 
         // A stalled hello must fail at the budget it was handed, not one of
         // its own.
-        assert!(send(&mut NeverDrains, notify("hello", serde_json::json!({})), remaining(handshake))
+        assert!(send(&mut NeverDrains, notify("hello", &Facts::default()).unwrap(), remaining(handshake))
             .await
             .is_err());
         assert_eq!(handshake.elapsed(), HUB_SILENCE, "the stall costs the budget, no more");
