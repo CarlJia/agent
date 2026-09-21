@@ -1,10 +1,10 @@
 //! Linux-only metric collection, read directly from /proc and statvfs.
 //! sysinfo is not used: it misreports memory and disk for this purpose.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, Ipv6Addr};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -81,7 +81,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "9p",
 ];
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct Facts {
     pub hostname: String,
     pub os: String,
@@ -108,11 +108,8 @@ pub struct Metrics {
     pub uptime: u64,
     pub cpu: f32,
     pub load: [f32; 3],
-    pub mem_total: u64,
     pub mem_used: u64,
-    pub swap_total: u64,
     pub swap_used: u64,
-    pub disk_total: u64,
     pub disk_used: u64,
     /// Kernel lifetime byte counters. The hub accumulates these; the agent
     /// stores nothing and does not attempt to survive a reboot.
@@ -129,7 +126,36 @@ pub struct Metrics {
 pub struct Collector {
     prev_cpu: Option<(u64, u64)>,
     prev_net: Option<(Instant, u64, u64)>,
+    /// `/proc/self/mounts` re-parsed on a TTL. The file is steady a host's whole
+    /// uptime, but rereading it every second would burn allocator and CPU for
+    /// the same answer; a freshly attached disk takes at most this delay to
+    /// enter the totals, which is invisible at dashboard cadence.
+    mounts_cache: Option<(Instant, Vec<String>)>,
+    /// `mem_total`/`swap_total`/`disk_total` are sampled only on hello and on
+    /// the rare frame they change. Tracking the previous triplet means the
+    /// change test is three u64 comparisons, no string parsing.
+    prev_invariants: Option<Invariants>,
+    /// Set by [`Collector::collect`] when the invariants drifted; drained by
+    /// [`Collector::take_pending_facts`] which the session uses to push a
+    /// fresh `hello` to the hub. None at other times.
+    pending_facts: Option<Facts>,
 }
+
+/// The triplet reported once on connect and again only when it changes. `None`
+/// `mem_total` is an impossible result of `meminfo` so it doubles as the
+/// "first reading" sentinel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Invariants {
+    mem_total: u64,
+    swap_total: u64,
+    disk_total: u64,
+}
+
+/// Refresh cadence for [`Collector::mounts_cache`]. A disk attached later
+/// waits at most this long to appear in the disk totals; reading once per
+/// second instead would still produce the same number, but allocate a fresh
+/// `Vec` and `String` per mount on every sample.
+const MOUNTS_TTL: Duration = Duration::from_secs(30);
 
 /// The version this binary tells the hub it runs. CI stamps the release tag
 /// into `AGENT_VERSION`; a local build falls back to the crate version, which
@@ -147,11 +173,11 @@ impl Collector {
         Self::default()
     }
 
-    pub fn facts(&self) -> Facts {
+    pub fn facts(&mut self) -> Facts {
         let (v4, v6) = addresses();
         let mem = meminfo();
         let (cpu_name, cpu_cores) = cpuinfo();
-        let (disk_total, _) = disk_usage(&real_mount_points());
+        let (disk_total, _) = disk_usage(self.real_mount_points());
         Facts {
             hostname: read_trim("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into()),
             os: os_pretty_name(),
@@ -160,8 +186,8 @@ impl Collector {
             virt: virtualization(),
             cpu_name,
             cpu_cores,
-            mem_total: mem.get("MemTotal").copied().unwrap_or(0),
-            swap_total: mem.get("SwapTotal").copied().unwrap_or(0),
+            mem_total: mem.total,
+            swap_total: mem.swap_total,
             disk_total,
             agent_version: build_version().into(),
             ipv4: v4,
@@ -173,21 +199,44 @@ impl Collector {
         let mem = meminfo();
         let (mem_total, mem_used) = mem_used(&mem);
         let (swap_total, swap_used) = swap_used(&mem);
-        let (disk_total, disk_used) = disk_usage(&real_mount_points());
+        let (disk_total, disk_used) = disk_usage(self.real_mount_points());
         let (rx_total, tx_total) = net_totals();
         let (rx, tx) = self.net_rate(rx_total, tx_total, Instant::now());
         let (tcp, udp) = conn_counts();
+        let (load, procs) = loadavg();
+
+        // `mem_total`/`swap_total`/`disk_total` are sent once on hello and
+        // refreshed on the rare frame they drift. A hot-swap of a disk or a
+        // memory hot-plug are the events that matter; a stable host pays
+        // three u64 comparisons and zero extra wire bytes per sample.
+        let invariants = Invariants { mem_total, swap_total, disk_total };
+        match self.prev_invariants {
+            // First sample of the session. The session-open hello already
+            // carried these totals, so only record the baseline -- queuing a
+            // re-hello here would send the same facts twice on every connect.
+            None => self.prev_invariants = Some(invariants),
+            // A later drift: queue fresh facts for the session loop to send as
+            // a hello before its next report, so the hub's totals update in the
+            // same tick the new `disk_used`/`mem_used` arrive.
+            Some(prev) if prev != invariants => {
+                self.prev_invariants = Some(invariants);
+                // `facts()` re-reads /proc, so its totals can differ by a hair
+                // from the ones just measured if a mount changed between the
+                // two reads. That drift is sub-millisecond and self-corrects on
+                // the next real change; the alternative -- threading the triplet
+                // through Facts -- couples the two structs for no real gain.
+                self.pending_facts = Some(self.facts());
+            }
+            Some(_) => {}
+        }
 
         Metrics {
             boot_id: read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
             uptime: uptime(),
             cpu: self.cpu_percent(),
-            load: loadavg(),
-            mem_total,
+            load,
             mem_used,
-            swap_total,
             swap_used,
-            disk_total,
             disk_used,
             net_rx_total: rx_total,
             net_tx_total: tx_total,
@@ -195,8 +244,30 @@ impl Collector {
             net_tx: tx,
             tcp,
             udp,
-            procs: proc_count(),
+            procs,
         }
+    }
+
+    /// Returns the facts queued by the last [`Collector::collect`] when an
+    /// invariant drifted, then clears them. The session sends the result as a
+    /// `hello` so the hub can refresh its totals. `None` at other times means
+    /// "nothing to push", which is the steady state on a stable host.
+    pub fn take_pending_facts(&mut self) -> Option<Facts> {
+        self.pending_facts.take()
+    }
+
+    /// Mount points backing disk totals. Cached for [`MOUNTS_TTL`] -- mount
+    /// tables change rarely and rereading on every sample would reparse and
+    /// reallocate the same rows. A hot-swap of a disk is visible after at most
+    /// one TTL; the agent reports disk usage on a panel that already rounds.
+    fn real_mount_points(&mut self) -> &[String] {
+        let now = Instant::now();
+        let stale = self.mounts_cache.as_ref().is_none_or(|(t, _)| now.duration_since(*t) >= MOUNTS_TTL);
+        if stale {
+            let fresh = parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default());
+            self.mounts_cache = Some((now, fresh));
+        }
+        &self.mounts_cache.as_ref().expect("populated above").1
     }
 
     /// CPU busy share since the previous call. The first call has no baseline
@@ -236,36 +307,58 @@ fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
 }
 
-/// Parses /proc/meminfo into bytes keyed by field name.
-fn meminfo() -> HashMap<String, u64> {
+/// The seven meminfo fields the rest of the file actually reads. A hashmap
+/// would have meant parsing all seventeen and allocating per-key, every
+/// second, for a handful of lookups; this struct keeps the same answer in a
+/// fixed shape.
+#[derive(Default)]
+struct MemInfo {
+    total: u64,
+    available: u64,
+    free: u64,
+    buffers: u64,
+    cached: u64,
+    swap_total: u64,
+    swap_free: u64,
+}
+
+/// Parses /proc/meminfo into the subset the agent reads.
+fn meminfo() -> MemInfo {
     parse_meminfo(&fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
-fn parse_meminfo(text: &str) -> HashMap<String, u64> {
-    text.lines()
-        .filter_map(|line| {
-            let (key, rest) = line.split_once(':')?;
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            Some((key.to_owned(), kb * 1024))
-        })
-        .collect()
+fn parse_meminfo(text: &str) -> MemInfo {
+    let mut out = MemInfo::default();
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else { continue };
+        let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) else { continue };
+        let b = kb * 1024;
+        match key {
+            "MemTotal" => out.total = b,
+            "MemAvailable" => out.available = b,
+            "MemFree" => out.free = b,
+            "Buffers" => out.buffers = b,
+            "Cached" => out.cached = b,
+            "SwapTotal" => out.swap_total = b,
+            "SwapFree" => out.swap_free = b,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// `free(1)`'s used column: total minus the kernel's MemAvailable estimate.
 /// sysinfo's `used_memory()` counts page cache as used and reads gigabytes high
 /// on a host that has been up for a while.
-fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
-    let g = |k: &str| m.get(k).copied().unwrap_or(0);
-    let total = g("MemTotal");
-    if total == 0 {
+fn mem_used(m: &MemInfo) -> (u64, u64) {
+    if m.total == 0 {
         return (0, 0);
     }
     // Absence selects the fallback, not a zero value: a host under real memory
     // pressure reports MemAvailable 0, and treating that as a missing field
     // would understate used memory precisely when it matters.
-    let available =
-        m.get("MemAvailable").copied().unwrap_or_else(|| g("MemFree") + g("Buffers") + g("Cached"));
-    (total, total.saturating_sub(available))
+    let available = if m.available != 0 { m.available } else { m.free + m.buffers + m.cached };
+    (m.total, m.total.saturating_sub(available))
 }
 
 /// `free(1)`'s Swap used column: `SwapTotal - SwapFree`, nothing more.
@@ -273,10 +366,8 @@ fn mem_used(m: &HashMap<String, u64>) -> (u64, u64) {
 /// Subtracting `SwapCached` would imply that pages swapped back in had released
 /// their slots. They have not -- the copy on the device still occupies blocks
 /// until something else claims them -- and the result runs about a fifth low.
-fn swap_used(m: &HashMap<String, u64>) -> (u64, u64) {
-    let g = |k: &str| m.get(k).copied().unwrap_or(0);
-    let total = g("SwapTotal");
-    (total, total.saturating_sub(g("SwapFree")))
+fn swap_used(m: &MemInfo) -> (u64, u64) {
+    (m.swap_total, m.swap_total.saturating_sub(m.swap_free))
 }
 
 /// Busy share between two `(total, idle)` jiffy readings.
@@ -309,11 +400,22 @@ fn parse_cpu_jiffies(text: &str) -> Option<(u64, u64)> {
     Some((v.iter().take(8).sum(), v[3] + v[4]))
 }
 
-fn loadavg() -> [f32; 3] {
+/// Three load averages from `/proc/loadavg` plus the kernel's count of total
+/// runnable tasks. Walking `/proc` once per sample would mean an `OsString`
+/// and `String` allocation per PID; the kernel already publishes the count on
+/// the same line as the load averages.
+///
+/// `/proc/loadavg` fourth field is `running/total`. `total` is updated by the
+/// kernel on fork/exit and matches `ls /proc | grep '^[0-9]' | wc -l` for the
+/// PID namespace the agent is in.
+fn loadavg() -> ([f32; 3], u32) {
     let text = fs::read_to_string("/proc/loadavg").unwrap_or_default();
     let mut it = text.split_whitespace();
-    let mut next = || it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    [next(), next(), next()]
+    let next_f =
+        |it: &mut std::str::SplitWhitespace<'_>| it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let loads = [next_f(&mut it), next_f(&mut it), next_f(&mut it)];
+    let procs = it.next().and_then(|s| s.split('/').nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (loads, procs)
 }
 
 fn uptime() -> u64 {
@@ -443,8 +545,10 @@ fn skip_iface(name: &str) -> bool {
 /// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link --
 /// and whether bytes were already counted says nothing about address
 /// ownership.
+const STACKED_PREFIXES: &[&str] = &["bond", "br", "vlan", "vmbr"];
+
 fn is_stacked(name: &str) -> bool {
-    name.contains('.') || ["bond", "br", "vlan", "vmbr"].iter().any(|p| name.starts_with(p))
+    name.contains('.') || STACKED_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// A pseudo filesystem, named outright or as a flavour of one such as
@@ -452,16 +556,6 @@ fn is_stacked(name: &str) -> bool {
 /// candidate, which would allocate a few hundred strings per second.
 fn skip_fstype(fstype: &str) -> bool {
     SKIP_FSTYPES.iter().any(|s| fstype == *s || fstype.strip_prefix(s).is_some_and(|r| r.starts_with('.')))
-}
-
-/// Mount points backed by real storage, deduplicated by source device so a bind
-/// mount or a second subvolume cannot double-count the same disk.
-///
-/// Re-read every sample rather than cached at startup, otherwise a disk attached
-/// later stays invisible until the agent restarts. /proc/self/mounts is a few
-/// kilobytes.
-fn real_mount_points() -> Vec<String> {
-    parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
 }
 
 fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
@@ -473,18 +567,35 @@ fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
         .collect()
 }
 
+/// `O(n)` rather than an `O(n²)` scan of the trailing slice per row.
+///
+/// Two filters go into the result, with opposite "first/last" preferences:
+///
+/// * a `mount` point is shadowed by any later row with the same path; the
+///   table is in mount order and a path resolves to the last mount on it,
+///   so the kept row is the **last** occurrence.
+/// * a `dev` is deduplicated by the first kept row that names it; bind mounts
+///   and ZFS datasets share one device, so the kept row is the **first**
+///   occurrence in the kept list.
+///
+/// The first pass marks the last occurrence of each mount with `is_last`.
+/// The second pass walks forward, drops rows that aren't last, and dedupes
+/// by dev on the rows that are.
 fn parse_mounts(text: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    let mut out = Vec::new();
     let rows = mount_rows(text);
+    let mut is_last: Vec<bool> = vec![false; rows.len()];
+    let mut last_index: HashSet<&str> = HashSet::new();
+    for (i, &(_, mount, _)) in rows.iter().enumerate().rev() {
+        // First reverse encounter = the last forward occurrence. Anything
+        // already in the set has a successor and is shadowed.
+        if last_index.insert(mount) {
+            is_last[i] = true;
+        }
+    }
+    let mut seen_devs: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
     for (i, &(dev, mount, fstype)) in rows.iter().enumerate() {
-        // The table is in mount order and a path resolves to the last mount on
-        // it, which is what statvfs below answers for. An earlier entry for the
-        // same point remains listed but is no longer reachable: under
-        // ProtectHome=yes a host whose /home is its own filesystem has that row
-        // sitting beneath a tmpfs, and counting it would book the tmpfs's size
-        // as /home's.
-        if rows[i + 1..].iter().any(|(_, m, _)| *m == mount) {
+        if !is_last[i] {
             continue;
         }
         if skip_fstype(fstype) {
@@ -495,10 +606,9 @@ fn parse_mounts(text: &str) -> Vec<String> {
         }
         // ZFS datasets and btrfs subvolumes share one pool's free space.
         let key = dev.split('/').next().filter(|_| fstype == "zfs").unwrap_or(dev).to_owned();
-        if seen.contains(&key) {
+        if !seen_devs.insert(key) {
             continue;
         }
-        seen.push(key);
         out.push(mount.replace("\\040", " "));
     }
     out
@@ -580,16 +690,6 @@ fn parse_sockstat(v4: &str, v6: &str) -> (u32, u32) {
     )
 }
 
-fn proc_count() -> u32 {
-    fs::read_dir("/proc")
-        .map(|d| {
-            d.filter_map(Result::ok)
-                .filter(|e| e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()))
-                .count() as u32
-        })
-        .unwrap_or(0)
-}
-
 fn cpuinfo() -> (String, u32) {
     let text = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let name = text
@@ -667,15 +767,15 @@ mod tests {
         assert_eq!(su, (1048572 - 987264) * 1024, "must match the `free` swap used column");
     }
 
-    fn g_cached(m: &HashMap<String, u64>) -> u64 {
-        m.get("Cached").copied().unwrap_or(0)
+    fn g_cached(m: &MemInfo) -> u64 {
+        m.cached
     }
 
     #[test]
     fn memory_falls_back_when_memavailable_is_absent() {
         let m = parse_meminfo("MemTotal: 1000 kB\nMemFree: 200 kB\nBuffers: 100 kB\nCached: 300 kB\n");
         assert_eq!(mem_used(&m), (1000 * 1024, 400 * 1024));
-        assert_eq!(mem_used(&HashMap::new()), (0, 0));
+        assert_eq!(mem_used(&MemInfo::default()), (0, 0));
     }
 
     #[test]
@@ -761,6 +861,40 @@ mod tests {
         assert_eq!(c.net_rate(50, 60, t2), (0, 0));
     }
 
+    /// The first sample only records the invariant baseline: the session-open
+    /// hello already carried these totals, so queuing a re-hello here would
+    /// send the same facts twice on every connect. A later drift does queue
+    /// one. Drives the state machine directly rather than the live /proc
+    /// values, so it holds on any host.
+    #[test]
+    fn a_re_hello_is_queued_only_when_an_invariant_drifts_after_the_first_sample() {
+        let mut c = Collector::new();
+
+        // First collect: baseline recorded, nothing queued.
+        let _ = c.collect();
+        assert!(c.prev_invariants.is_some(), "the first sample records the baseline");
+        assert!(
+            c.take_pending_facts().is_none(),
+            "the session-open hello covers the first sample; no duplicate re-hello"
+        );
+
+        // No change since: still nothing queued.
+        let _ = c.collect();
+        assert!(c.take_pending_facts().is_none(), "a steady host queues no re-hello");
+
+        // Force a drifted baseline, as a disk hot-plug or memory resize would:
+        // the next collect must notice and queue fresh facts.
+        c.prev_invariants = Some(Invariants { mem_total: 1, swap_total: 1, disk_total: 1 });
+        let _ = c.collect();
+        assert!(
+            c.take_pending_facts().is_some(),
+            "a drifted invariant queues a re-hello so the hub can refresh totals"
+        );
+
+        // And draining it leaves the queue empty again.
+        assert!(c.take_pending_facts().is_none(), "take_pending_facts drains what it returns");
+    }
+
     /// Two independent guards reject a mount: its filesystem type, and whether
     /// its source looks like a device. Most entries trip both, so the table
     /// includes a line that only one of them catches.
@@ -823,8 +957,8 @@ mod tests {
         assert!(!f.ipv4.starts_with("172.17."), "a virtual bridge is not this machine's address");
         let m = c.collect();
         assert!(!m.boot_id.is_empty(), "boot_id drives reboot detection");
-        assert!(m.mem_used > 0 && m.mem_used < m.mem_total);
-        assert!(m.disk_used <= m.disk_total && m.disk_total > 0);
+        assert!(m.mem_used > 0 && m.mem_used < f.mem_total);
+        assert!(m.disk_used <= f.disk_total && f.disk_total > 0);
         assert!((0.0..=100.0).contains(&m.cpu));
     }
 
@@ -936,10 +1070,14 @@ mod crosscheck {
     fn memory_and_disk_agree_with_free_and_df_on_this_machine() {
         let mut c = Collector::new();
         let m = c.collect();
+        // Totals live in `facts()` now: the report no longer carries them
+        // (hello-folded on the hub side), so the cross-check has to ask for
+        // them explicitly.
+        let f = c.facts();
         let gib = |b: u64| b as f64 / 1024.0 / 1024.0 / 1024.0;
-        println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(m.mem_total));
-        println!("disk used={:.2}G total={:.2}G", gib(m.disk_used), gib(m.disk_total));
-        println!("swap used={:.2}G total={:.2}G", gib(m.swap_used), gib(m.swap_total));
+        println!("mem  used={:.2}G total={:.2}G", gib(m.mem_used), gib(f.mem_total));
+        println!("disk used={:.2}G total={:.2}G", gib(m.disk_used), gib(f.disk_total));
+        println!("swap used={:.2}G total={:.2}G", gib(m.swap_used), gib(f.swap_total));
         println!("net  rx_total={} tx_total={}", m.net_rx_total, m.net_tx_total);
 
         const TOLERANCE: u64 = 64 * 1024 * 1024;
@@ -953,7 +1091,7 @@ mod crosscheck {
         let free = tool("free", &["-b"]);
         let mut row = free.lines().nth(1).expect("free prints a Mem: row").split_whitespace().skip(1);
         let parse = |v: Option<&str>| v.expect("free column").parse::<u64>().expect("a byte count");
-        assert_eq!(m.mem_total, parse(row.next()), "MemTotal is not free's total");
+        assert_eq!(f.mem_total, parse(row.next()), "MemTotal is not free's total");
         close(m.mem_used, parse(row.next()), "memory");
 
         // free(1) row "Swap:": total, used, free. The tolerance is far tighter
@@ -962,7 +1100,7 @@ mod crosscheck {
         // admit. Swap moves slowly enough for a megabyte to suffice.
         const SWAP_TOLERANCE: u64 = 1024 * 1024;
         let mut row = free.lines().nth(2).expect("free prints a Swap: row").split_whitespace().skip(1);
-        assert_eq!(m.swap_total, parse(row.next()), "SwapTotal is not free's swap total");
+        assert_eq!(f.swap_total, parse(row.next()), "SwapTotal is not free's swap total");
         let theirs = parse(row.next());
         let drift = m.swap_used.abs_diff(theirs);
         assert!(drift < SWAP_TOLERANCE, "swap: ours={} theirs={theirs} drift={drift}", m.swap_used);
