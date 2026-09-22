@@ -37,10 +37,10 @@ monitor-agent --server https://your-hub --token <token>
 
 ## 上报字段
 
-`src/collect.rs` 中的 `Facts` 与 `Metrics` 两个 struct 直接序列化为线上 JSON，是字段的权威定义。
+`src/collect.rs` 中的 `Facts` 与 `Metrics` 两个 struct 通过 MessagePack 编码上送（envelope 沿用 JSON-RPC 形状：`version` / `jsonrpc` / `method` / `params`，由 `monitor/src/agent_ws.rs` 与 `agent/src/main.rs` 解析），是字段的权威定义。
 
-- **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6
-- **`Metrics`** 每 `--interval` 秒上报：CPU、负载、内存、swap、磁盘、网卡收发速率与内核累计计数器、TCP / UDP 连接数、进程数、运行时间
+- **`Facts`** 连接时上报一次，之后仅在变化时重发：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存 / swap / 磁盘总量、agent 版本、本机 IPv4 / IPv6
+- **`Metrics`** 每 `--interval` 秒上报（默认 1 秒）：`boot_id`、运行时间、CPU、负载、内存 / swap / 磁盘用量、网卡收发速率与内核 lifetime 累计计数器、TCP / UDP 连接数、进程数
 
 `net_rx_total` / `net_tx_total` 为内核 lifetime 计数器，原样上报；`boot_id` 取自
 `/proc/sys/kernel/random/boot_id`，是 hub 判定主机重启的唯一依据，**不要删**。
